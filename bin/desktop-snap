@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""desktop-snap: WSL-Wrapper für das Windows-Screenshot-Tool desktop-snap.exe.
+
+Der Wrapper startet die EXE immer ohne stdin und mit hartem Timeout, lässt PNGs
+zuerst im lokalen Windows-Temp entstehen (kein 9p-Pfad), kopiert sie nur bei
+Exit 0 atomar an das Ziel und schreibt für jeden Capture-Versuch eine
+metadatenbasierte Audit-Zeile ohne Pixeldaten. JSON-Receipts und Exit-Codes der
+EXE werden unverändert durchgereicht.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+WRAPPER_VERSION = "0.1.0"
+# Windows paths are derived from the current Windows user profile (see win_profile()),
+# never hardcoded. Every location can be overridden through a DESKTOP_SNAP_* variable.
+PROFILE_LOOKUP_TIMEOUT_S = 3.0
+DEFAULT_CONFIG_DIR = "~/.config/desktop-snap"
+DEFAULT_STATE_DIR = "~/.local/state/desktop-snap"
+DEFAULT_TIMEOUT_S = 8.0
+STAGING_MAX_AGE_S = 3600
+AUDIT_MAX_LINES = 1000
+KILL_GRACE_S = 2.0
+FLATTEN_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+EXIT_OK = 0
+EXIT_NOT_FOUND = 1
+EXIT_FLAT = 2
+EXIT_AMBIGUOUS = 3
+EXIT_MINIMIZED = 4
+EXIT_CAPTURE_DENIED = 5
+EXIT_SENSITIVE = 6
+EXIT_RUNTIME = 7
+EXIT_POLICY = 8
+
+# Exit-Code -> error_code, wie in der Tabelle der Architektur.
+ERROR_CODES = {
+    EXIT_NOT_FOUND: "not_found",
+    EXIT_FLAT: "flat_image",
+    EXIT_AMBIGUOUS: "ambiguous_match",
+    EXIT_MINIMIZED: "window_minimized",
+    EXIT_CAPTURE_DENIED: "capture_denied",
+    EXIT_SENSITIVE: "denied_sensitive_window",
+    EXIT_RUNTIME: "runtime_error",
+    EXIT_POLICY: "policy_denied",
+}
+CAPTURE_MODES = ("window", "group", "preset", "region", "monitor")
+
+
+class WrapperError(Exception):
+    """Fehler, die der Wrapper selbst meldet (Exit 7, JSON-Receipt)."""
+
+    def __init__(self, message: str, error_code: str = "runtime_error", exit_code: int = EXIT_RUNTIME):
+        super().__init__(message)
+        self.error_code = error_code
+        self.exit_code = exit_code
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse-Fehler als JSON mit Exit 7 melden; Exit 2 gehört der EXE (flat_image)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        emit(failure("cli", "runtime_error", f"ungültige CLI-Argumente: {message}"))
+        raise SystemExit(EXIT_RUNTIME)
+
+
+@dataclass
+class RunResult:
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    error: str | None = None
+
+
+@dataclass
+class Attempt:
+    """Metadaten eines Capture-Versuchs für das Audit-Log (ohne Pixeldaten)."""
+
+    mode: str
+    target: str
+    target_processes: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------- Umgebung
+
+
+def env_path(name: str, default: str) -> Path:
+    return Path(os.environ.get(name, default)).expanduser()
+
+
+_WIN_PROFILE: dict[str, str] | None = None
+
+
+def parse_win_profile(cmd_output: str) -> dict[str, str]:
+    """Parses the two lines printed by `cmd.exe /C echo %USERPROFILE%&echo %LOCALAPPDATA%`."""
+    lines = [line.strip() for line in cmd_output.splitlines() if line.strip()]
+    if len(lines) < 2 or not all(re.match(r"^[A-Za-z]:\\", line) for line in lines[:2]):
+        raise WrapperError("Windows-Benutzerprofil konnte nicht ermittelt werden (unerwartete cmd.exe-Ausgabe)")
+    return {"userprofile": lines[0].rstrip("\\"), "localappdata": lines[1].rstrip("\\")}
+
+
+def win_profile() -> dict[str, str]:
+    """Current Windows user profile and LocalAppData, resolved once per process.
+
+    DESKTOP_SNAP_WIN_USER (e.g. C:\\Users\\Alice) skips the lookup; the tests use it for
+    deterministic paths.
+    """
+    global _WIN_PROFILE
+    if _WIN_PROFILE is not None:
+        return _WIN_PROFILE
+    override = os.environ.get("DESKTOP_SNAP_WIN_USER")
+    if override:
+        profile = override.rstrip("\\")
+        _WIN_PROFILE = {"userprofile": profile, "localappdata": profile + r"\AppData\Local"}
+        return _WIN_PROFILE
+    try:
+        proc = subprocess.run(
+            ["cmd.exe", "/C", "echo %USERPROFILE%&echo %LOCALAPPDATA%"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            cwd="/mnt/c",
+            timeout=PROFILE_LOOKUP_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WrapperError(f"Windows-Benutzerprofil nicht ermittelbar: {error}") from error
+    if proc.returncode != 0:
+        raise WrapperError(f"Windows-Benutzerprofil nicht ermittelbar (cmd.exe Exit {proc.returncode})")
+    _WIN_PROFILE = parse_win_profile(proc.stdout)
+    return _WIN_PROFILE
+
+
+def exe_path() -> Path:
+    if os.environ.get("DESKTOP_SNAP_EXE"):
+        return env_path("DESKTOP_SNAP_EXE", "")
+    return to_linux_path(win_profile()["userprofile"] + r"\Apps\DesktopSnap\desktop-snap.exe")
+
+
+def staging_win_dir() -> str:
+    if os.environ.get("DESKTOP_SNAP_STAGING_WIN_DIR"):
+        return os.environ["DESKTOP_SNAP_STAGING_WIN_DIR"]
+    return win_profile()["localappdata"] + r"\Temp\desktop-snap"
+
+
+def staging_dir() -> Path:
+    if os.environ.get("DESKTOP_SNAP_STAGING_DIR"):
+        return env_path("DESKTOP_SNAP_STAGING_DIR", "")
+    return to_linux_path(win_profile()["localappdata"] + r"\Temp\desktop-snap")
+
+
+def config_dir() -> Path:
+    return env_path("DESKTOP_SNAP_CONFIG_DIR", DEFAULT_CONFIG_DIR)
+
+
+def state_dir() -> Path:
+    return env_path("DESKTOP_SNAP_STATE_DIR", DEFAULT_STATE_DIR)
+
+
+def desktop_temp_dir() -> Path:
+    if os.environ.get("DESKTOP_SNAP_DESKTOP_TEMP"):
+        return env_path("DESKTOP_SNAP_DESKTOP_TEMP", "")
+    return to_linux_path(win_profile()["userprofile"] + r"\Desktop\temp")
+
+
+def default_presets_path() -> Path:
+    # Resolved through the symlink, so the repo config is found from ~/.local/bin.
+    return Path(__file__).resolve().parent.parent / "config" / "presets.default.json"
+
+
+def wrapper_hash() -> str:
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:16]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mnt_root() -> str:
+    # Overridable so tests can map drive paths into a temp directory.
+    return os.environ.get("DESKTOP_SNAP_MNT_ROOT", "/mnt")
+
+
+def to_linux_path(value: str) -> Path:
+    """Accepts Linux paths and drive paths such as C:\\Users\\... (mapped to /mnt/c)."""
+    if len(value) >= 3 and value[1] == ":" and value[2] in "\\/":
+        rest = value[3:].replace("\\", "/")
+        return Path(f"{mnt_root()}/{value[0].lower()}/{rest}")
+    return Path(value).expanduser()
+
+
+def win_join(win_dir: str, name: str) -> str:
+    return win_dir.rstrip("\\") + "\\" + name
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+# ---------------------------------------------------------------- Receipts
+
+
+def emit(receipt: dict[str, Any]) -> None:
+    print(json.dumps(receipt, ensure_ascii=False))
+
+
+def failure(mode: str, error_code: str, message: str, exit_code: int = EXIT_RUNTIME, **extra: Any) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "ok": False,
+        "exit_code": exit_code,
+        "error_code": error_code,
+        "message": message,
+        "mode": mode,
+    }
+    receipt.update(extra)
+    return receipt
+
+
+def parse_receipt(stdout: str) -> dict[str, Any] | None:
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        value = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+# ---------------------------------------------------------------- EXE-Aufruf
+
+
+def kill_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM an die Prozessgruppe, nach höchstens KILL_GRACE_S SIGKILL."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=KILL_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def run_exe(args: list[str], timeout: float) -> RunResult:
+    try:
+        exe = exe_path()
+    except WrapperError as error:
+        return RunResult(error=str(error))
+    if not exe.is_file():
+        return RunResult(error=f"desktop-snap.exe nicht gefunden: {exe}")
+    try:
+        proc = subprocess.Popen(
+            [str(exe), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return RunResult(error=f"desktop-snap.exe konnte nicht gestartet werden: {error}")
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return RunResult(
+            returncode=proc.returncode,
+            stdout=out.decode("utf-8", errors="replace"),
+            stderr=err.decode("utf-8", errors="replace"),
+        )
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        try:
+            out, err = proc.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            out, err = b"", b""
+        return RunResult(
+            returncode=proc.returncode,
+            stdout=out.decode("utf-8", errors="replace"),
+            stderr=err.decode("utf-8", errors="replace"),
+            timed_out=True,
+        )
+
+
+def interpret(run: RunResult, mode: str, timeout: float) -> dict[str, Any]:
+    """Wandelt das EXE-Ergebnis in eine Receipt mit ok, exit_code und error_code um."""
+    if run.error:
+        raise WrapperError(run.error)
+    if run.timed_out:
+        return failure(
+            mode, "timeout", f"desktop-snap.exe überschritt {timeout:g} s und wurde beendet",
+            EXIT_RUNTIME, timed_out=True,
+        )
+    code = run.returncode if run.returncode is not None else EXIT_RUNTIME
+    parsed = parse_receipt(run.stdout)
+    if parsed is None:
+        exit_code = code if code != EXIT_OK else EXIT_RUNTIME
+        if exit_code not in range(0, 9):
+            exit_code = EXIT_RUNTIME
+        return failure(
+            mode, ERROR_CODES.get(exit_code, "runtime_error"),
+            f"keine JSON-Antwort der EXE (Exit {code})", exit_code,
+            stderr_tail=run.stderr.strip()[-300:],
+        )
+    receipt = dict(parsed)
+    receipt["exit_code"] = code if code in range(0, 9) else EXIT_RUNTIME
+    receipt["ok"] = receipt["exit_code"] == EXIT_OK
+    receipt.setdefault("mode", mode)
+    return receipt
+
+
+# ---------------------------------------------------------------- Staging & Kopie
+
+
+def cleanup_stale_staging(directory: Path, now: float) -> None:
+    for pattern in ("*.png", "*.json"):
+        for item in directory.glob(pattern):
+            try:
+                if item.is_file() and item.stat().st_mtime < now - STAGING_MAX_AGE_S:
+                    item.unlink()
+            except OSError:
+                pass
+
+
+def atomic_copy(source: Path, destination: Path) -> None:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    except OSError as error:
+        raise WrapperError(f"Zieldatei {destination} konnte nicht geschrieben werden: {error}") from error
+
+
+def validate_denylist(path: Path) -> None:
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WrapperError(f"denylist.json ist nicht lesbar oder kein gültiges JSON: {error}") from error
+
+
+def stage_denylist(staging: Path) -> tuple[Path | None, list[str]]:
+    """Copies ~/.config/desktop-snap/denylist.json into staging for --extra-denylist.
+
+    Returns the staged file (to be removed by the caller) and the extra EXE arguments.
+    Without a denylist nothing is staged and no argument is added.
+    """
+    denylist = config_dir() / "denylist.json"
+    if not denylist.is_file():
+        return None, []
+    validate_denylist(denylist)
+    staging.mkdir(parents=True, exist_ok=True)
+    staged_json = staging / f"{uuid.uuid4().hex}.json"
+    try:
+        shutil.copyfile(denylist, staged_json)
+    except OSError:
+        staged_json.unlink(missing_ok=True)
+        raise
+    return staged_json, ["--extra-denylist", win_join(staging_win_dir(), staged_json.name)]
+
+
+def capture(
+    attempt: Attempt,
+    exe_args: list[str],
+    out: str | None,
+    copy_desktop: bool,
+    flatten_bg: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Runs one capture through the staging directory. Never raises; cleanup is in finally."""
+    staged_png: Path | None = None
+    staged_json: Path | None = None
+    receipt: dict[str, Any] = failure(attempt.mode, "runtime_error", "unerwarteter Wrapper-Fehler")
+    try:
+        staging = staging_dir()
+        staging.mkdir(parents=True, exist_ok=True)
+        cleanup_stale_staging(staging, time.time())
+        staged_png = staging / f"{uuid.uuid4().hex}.png"
+        win_png = win_join(staging_win_dir(), staged_png.name)
+
+        staged_json, extra = stage_denylist(staging)
+
+        cmd = [*exe_args, "--out", win_png, *extra]
+        if flatten_bg:
+            cmd += ["--flatten-bg", flatten_bg]
+        run = run_exe(cmd, timeout)
+        receipt = interpret(run, attempt.mode, timeout)
+
+        if receipt["exit_code"] == EXIT_OK:
+            if not staged_png.is_file():
+                raise WrapperError("EXE meldete Exit 0, aber das Staging-PNG fehlt")
+            receipt["output_path"] = None
+            receipt["sha256"] = None
+            if out:
+                destination = to_linux_path(out)
+                atomic_copy(staged_png, destination)
+                receipt["output_path"] = str(destination)
+                receipt["sha256"] = file_sha256(destination)
+            if copy_desktop:
+                # Windows --out paths must yield a plain file name (foo.png), not C:\Users\...\foo.png.
+                name = to_linux_path(out).name if out else f"desktop-snap-{uuid.uuid4().hex[:8]}.png"
+                desktop_target = desktop_temp_dir() / name
+                atomic_copy(staged_png, desktop_target)
+                receipt["desktop_temp_path"] = str(desktop_target)
+                receipt["output_path"] = receipt["output_path"] or str(desktop_target)
+                receipt["sha256"] = receipt["sha256"] or file_sha256(desktop_target)
+    except WrapperError as error:
+        receipt = failure(attempt.mode, error.error_code, str(error), error.exit_code)
+    except OSError as error:
+        receipt = failure(attempt.mode, "runtime_error", f"Staging fehlgeschlagen: {error}")
+    finally:
+        for leftover in (staged_png, staged_json):
+            if leftover is not None:
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return receipt
+
+
+# ---------------------------------------------------------------- Audit
+
+
+def append_audit(path: Path, record: dict[str, Any]) -> None:
+    """Appends one JSONL line under flock and keeps only the last AUDIT_MAX_LINES lines."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch(mode=0o600)
+    line = json.dumps(record, ensure_ascii=False)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            lines = handle.read().splitlines()
+            lines.append(line)
+            lines = lines[-AUDIT_MAX_LINES:]
+            handle.seek(0)
+            handle.truncate()
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def audit_attempt(attempt: Attempt, receipt: dict[str, Any], started: float) -> None:
+    record = {
+        "ts": utc_now(),
+        "caller_pane": (
+            os.environ.get("DESKTOP_SNAP_CALLER")
+            or os.environ.get("HERDR_PANE_ID")
+            or os.environ.get("TMUX_PANE")
+        ),
+        "mode": attempt.mode,
+        "target": attempt.target,
+        "target_processes": attempt.target_processes,
+        "backend": receipt.get("backend"),
+        "ok": bool(receipt.get("ok")),
+        "exit_code": receipt.get("exit_code"),
+        "output_path": receipt.get("output_path"),
+        "sha256": receipt.get("sha256"),
+        "flat": bool(receipt.get("flat", False)),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+    }
+    try:
+        append_audit(state_dir() / "audit.jsonl", record)
+    except OSError as error:
+        receipt["audit_error"] = f"Audit-Log nicht schreibbar: {error}"
+
+
+# ---------------------------------------------------------------- Presets
+
+
+def load_presets_file(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WrapperError(f"{path} ist nicht lesbar oder kein gültiges JSON: {error}") from error
+    presets = data.get("presets") if isinstance(data, dict) else None
+    return presets if isinstance(presets, dict) else None
+
+
+def resolve_preset(name: str) -> list[dict[str, Any]]:
+    """User presets (~/.config/desktop-snap/presets.json) win; the repo default is the fallback."""
+    for path in (config_dir() / "presets.json", default_presets_path()):
+        presets = load_presets_file(path)
+        if presets is not None and name in presets:
+            entries = presets[name]
+            if not isinstance(entries, list) or not entries:
+                raise WrapperError(f"Preset '{name}' in {path} ist leer oder ungültig")
+            return entries
+    raise WrapperError(f"Preset '{name}' ist nicht bekannt", "preset_not_found", EXIT_NOT_FOUND)
+
+
+def preset_match_specs(entries: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    specs: list[str] = []
+    processes: list[str] = []
+    for entry in entries:
+        process = entry.get("process")
+        title = entry.get("title")
+        if not process and not title:
+            raise WrapperError("Preset-Eintrag braucht 'process' und/oder 'title'")
+        for value in (process, title):
+            if value is not None and (not isinstance(value, str) or ";" in value):
+                raise WrapperError("Preset-Werte müssen Text ohne ';' sein")
+        if process and title:
+            specs.append(f"process={process};title={title}")
+        elif title:
+            specs.append(title)
+        else:
+            specs.append(f"process={process}")
+        if process:
+            processes.append(process)
+    return specs, processes
+
+
+# ---------------------------------------------------------------- Kommandos
+
+
+def window_args(args: argparse.Namespace) -> tuple[list[str], Attempt]:
+    if not (args.title or args.process or args.hwnd):
+        raise WrapperError("Fensterwahl fehlt: --title, --process oder --hwnd angeben")
+    cmd = ["window"]
+    for flag, value in (("--title", args.title), ("--process", args.process), ("--hwnd", args.hwnd)):
+        if value:
+            cmd += [flag, value]
+    target = " ".join(f"{k}={v}" for k, v in (("title", args.title), ("process", args.process), ("hwnd", args.hwnd)) if v)
+    return cmd, Attempt("window", target, [args.process] if args.process else [])
+
+
+def group_args(matches: list[str]) -> list[str]:
+    cmd = ["group"]
+    for spec in matches:
+        cmd += ["--match", spec]
+    return cmd
+
+
+def region_args(args: argparse.Namespace) -> tuple[list[str], Attempt]:
+    if args.w <= 0 or args.h <= 0:
+        raise WrapperError("--w und --h müssen größer als 0 sein")
+    cmd = ["region", "--x", str(args.x), "--y", str(args.y), "--w", str(args.w), "--h", str(args.h)]
+    if args.process:
+        cmd += ["--process", args.process]
+    if args.hwnd:
+        cmd += ["--hwnd", args.hwnd]
+    if args.allow_full_monitor:
+        cmd.append("--allow-full-monitor")
+    target = f"region x={args.x} y={args.y} w={args.w} h={args.h}"
+    if args.process:
+        target += f" process={args.process}"
+    if args.hwnd:
+        target += f" hwnd={args.hwnd}"
+    return cmd, Attempt("region", target, [args.process] if args.process else [])
+
+
+def monitor_args(args: argparse.Namespace) -> tuple[list[str], Attempt]:
+    cmd = ["monitor", "--index", str(args.index)]
+    if args.allow_full_monitor:
+        cmd.append("--allow-full-monitor")
+    return cmd, Attempt("monitor", f"monitor index={args.index}")
+
+
+def run_capture(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    started = time.monotonic()
+    attempt: Attempt | None = None
+    try:
+        if not (args.out or args.copy_desktop_temp):
+            raise WrapperError("--out <pfad> oder --copy-desktop-temp angeben")
+        if args.flatten_bg and not FLATTEN_RE.match(args.flatten_bg):
+            raise WrapperError("--flatten-bg erwartet #RRGGBB")
+        if args.timeout <= 0:
+            raise WrapperError("--timeout muss größer als 0 sein")
+
+        if args.mode == "window":
+            exe_args, attempt = window_args(args)
+        elif args.mode == "group":
+            specs = args.match
+            processes = [s.split(";")[0][len("process="):] for s in specs if s.startswith("process=")]
+            attempt = Attempt("group", " | ".join(specs), processes)
+            exe_args = group_args(specs)
+        elif args.mode == "preset":
+            entries = resolve_preset(args.name)
+            specs, processes = preset_match_specs(entries)
+            attempt = Attempt("preset", args.name, processes)
+            exe_args = group_args(specs)
+        elif args.mode == "region":
+            exe_args, attempt = region_args(args)
+        else:
+            exe_args, attempt = monitor_args(args)
+    except WrapperError as error:
+        attempt = attempt or Attempt(args.mode, args.mode)
+        receipt = failure(args.mode, error.error_code, str(error), error.exit_code)
+        audit_attempt(attempt, receipt, started)
+        return receipt, error.exit_code
+
+    receipt = capture(attempt, exe_args, args.out, args.copy_desktop_temp, args.flatten_bg, args.timeout)
+    audit_attempt(attempt, receipt, started)
+    return receipt, int(receipt["exit_code"])
+
+
+def run_list(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    staged_json: Path | None = None
+    receipt: dict[str, Any]
+    try:
+        # The same denylist applies to listings, so a titled list cannot reveal a denied window's title.
+        staged_json, extra = stage_denylist(staging_dir())
+        cmd = ["list", *(["--titles"] if args.titles else []), *extra]
+        run = run_exe(cmd, args.timeout)
+        receipt = interpret(run, "list", args.timeout)
+    except WrapperError as error:
+        receipt = failure("list", error.error_code, str(error), error.exit_code)
+    except OSError as error:
+        receipt = failure("list", "runtime_error", f"Staging fehlgeschlagen: {error}")
+    finally:
+        if staged_json is not None:
+            try:
+                staged_json.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return receipt, int(receipt["exit_code"])
+
+
+def run_version() -> tuple[dict[str, Any], int]:
+    receipt: dict[str, Any] = {
+        "ok": True,
+        "exit_code": EXIT_OK,
+        "error_code": None,
+        "message": "desktop-snap Wrapper",
+        "mode": "version",
+        "version": WRAPPER_VERSION,
+        "wrapper_hash": wrapper_hash(),
+        "exe_build_hash": None,
+    }
+    run = run_exe(["--version"], DEFAULT_TIMEOUT_S)
+    if run.error:
+        receipt["exe_error"] = run.error
+    else:
+        parsed = parse_receipt(run.stdout) or {}
+        receipt["exe_build_hash"] = parsed.get("build_hash")
+        receipt["exe_version"] = parsed.get("version")
+    return receipt, EXIT_OK
+
+
+def run_doctor(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    checks: dict[str, bool] = {}
+    details: dict[str, Any] = {}
+
+    try:
+        checks["exe_present"] = exe_path().is_file()
+    except WrapperError as error:
+        checks["exe_present"] = False
+        details["exe_path_error"] = str(error)
+    try:
+        staging = staging_dir()
+        staging.mkdir(parents=True, exist_ok=True)
+        probe = staging / f".doctor-{uuid.uuid4().hex}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks["staging_writable"] = True
+    except (OSError, WrapperError) as error:
+        checks["staging_writable"] = False
+        details["staging_error"] = str(error)
+
+    try:
+        load_presets_file(config_dir() / "presets.json")
+        load_presets_file(default_presets_path())
+        checks["presets_readable"] = True
+    except WrapperError as error:
+        checks["presets_readable"] = False
+        details["presets_error"] = str(error)
+
+    exe_build_hash = None
+    if checks["exe_present"]:
+        run = run_exe(["doctor"], args.timeout)
+        parsed = None if run.error else parse_receipt(run.stdout)
+        if parsed is None:
+            checks["wgc_supported"] = False
+            details["exe_doctor_error"] = run.error or f"keine JSON-Antwort (Exit {run.returncode})"
+        else:
+            checks["wgc_supported"] = parsed.get("wgc_supported") is True
+            exe_build_hash = parsed.get("build_hash")
+    else:
+        checks["wgc_supported"] = False
+
+    ok = all(checks.values())
+    return {
+        "ok": ok,
+        "exit_code": EXIT_OK if ok else EXIT_RUNTIME,
+        "error_code": None if ok else "runtime_error",
+        "message": "alle Prüfungen grün" if ok else "mindestens eine Prüfung fehlgeschlagen",
+        "mode": "doctor",
+        "checks": checks,
+        "exe_build_hash": exe_build_hash,
+        "wrapper_version": WRAPPER_VERSION,
+        "wrapper_hash": wrapper_hash(),
+        **details,
+    }, (EXIT_OK if ok else EXIT_RUNTIME)
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = Parser(prog="desktop-snap", description="Windows-Desktop-Screenshots über WGC (WSL-Wrapper).")
+    sub = parser.add_subparsers(dest="mode", required=True, parser_class=Parser)
+
+    def common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--json", action="store_true", help="Receipt als JSON (Standard)")
+        p.add_argument("--out", help="Zieldatei (Linux- oder C:\\-Pfad)")
+        p.add_argument("--copy-desktop-temp", action="store_true", help="zusätzlich nach Desktop\\temp kopieren")
+        p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="EXE-Timeout in Sekunden")
+        p.add_argument("--flatten-bg", metavar="#RRGGBB", help="opake Hintergrundfüllung")
+
+    window = sub.add_parser("window")
+    common(window)
+    window.add_argument("--title")
+    window.add_argument("--process")
+    window.add_argument("--hwnd")
+
+    group = sub.add_parser("group")
+    common(group)
+    group.add_argument("--match", action="append", required=True)
+
+    preset = sub.add_parser("preset")
+    common(preset)
+    preset.add_argument("name")
+
+    listing = sub.add_parser("list")
+    listing.add_argument("--json", action="store_true")
+    listing.add_argument("--titles", action="store_true")
+    listing.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+
+    region = sub.add_parser("region")
+    common(region)
+    region.add_argument("--x", type=int, required=True)
+    region.add_argument("--y", type=int, required=True)
+    region.add_argument("--w", type=int, required=True)
+    region.add_argument("--h", type=int, required=True)
+    region.add_argument("--process")
+    region.add_argument("--hwnd")
+    region.add_argument("--allow-full-monitor", action="store_true")
+
+    monitor = sub.add_parser("monitor")
+    common(monitor)
+    monitor.add_argument("--index", type=int, required=True)
+    monitor.add_argument("--allow-full-monitor", action="store_true")
+
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--version" in argv:
+        receipt, code = run_version()
+        emit(receipt)
+        return code
+
+    args = build_parser().parse_args(argv)
+    if args.mode == "list":
+        receipt, code = run_list(args)
+    elif args.mode == "doctor":
+        receipt, code = run_doctor(args)
+    else:
+        receipt, code = run_capture(args)
+    emit(receipt)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

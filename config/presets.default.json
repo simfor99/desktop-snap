@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "presets": {
+    "nightwatcher": [
+      {
+        "process": "Herdr-Nachtwaechter.exe",
+        "title": "Herdr-Nachtwächter - Live-Status"
+      },
+      {
+        "process": "Herdr-Nachtwaechter.exe",
+        "title": "Herdr-Nachtwächter - Limits"
+      }
+    ]
+  }
+}
