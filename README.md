@@ -13,7 +13,9 @@ The project has two parts:
 
 ![Herdr Night Watch captured live with desktop-snap](docs/images/example-herdr-night-watch.png)
 
-Captured live from WSL2 with `desktop-snap preset nightwatcher --out ./nightwatcher.png` (`wgc-composite`, `590×950`, `12,049` distinct colors, `653 ms`) on [Herdr Night Watch](https://github.com/simfor99/herdr-night-watch) — a transparent, borderless OpenGL (`eframe`/`glow`) dashboard with a docked Limits satellite window, stitched seamlessly via `DWMWA_EXTENDED_FRAME_BOUNDS` with preserved corner transparency.
+This screenshot is just an example of what `desktop-snap` captures cleanly: it was taken live from WSL2 using `desktop-snap preset nightwatcher --out ./nightwatcher.png` (`wgc-composite`, `590×950`, `12,049` distinct colors, `653 ms`), stitching two transparent, borderless OpenGL (`eframe`/`glow`) windows via `DWMWA_EXTENDED_FRAME_BOUNDS` with preserved corner transparency.
+
+The app shown is [Herdr Night Watch](https://github.com/simfor99/herdr-night-watch), a companion project of mine that works alongside **Herdr** to keep an eye on both system hardware telemetry (CPU, RAM, GPU, VRAM, power draw) and LLM usage limits and pacing directly on the Windows desktop. `desktop-snap` itself has no dependency on it — it works with any Windows application.
 
 ## Features
 
