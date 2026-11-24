@@ -60,7 +60,9 @@ def main():
         if extra and staged(extra).exists():
             entry["extra_denylist_content"] = staged(extra).read_text(encoding="utf-8")
         record(entry)
-        print(json.dumps({"ok": True, "exit_code": 0, "windows": []}))
+        raw_windows = os.environ.get("FAKE_LIST_WINDOWS")
+        windows = json.loads(raw_windows) if raw_windows else []
+        print(json.dumps({"ok": True, "exit_code": 0, "windows": windows}))
         return 0
 
     stdin_data = sys.stdin.read()

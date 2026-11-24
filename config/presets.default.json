@@ -10,6 +10,12 @@
         "process": "Herdr-Nachtwaechter.exe",
         "title": "Herdr-Nachtwächter - Limits"
       }
+    ],
+    "herdr": [
+      {
+        "process": "WindowsTerminal.exe",
+        "skip_minimized": true
+      }
     ]
   }
 }

@@ -65,10 +65,17 @@ CAPTURE_MODES = ("window", "group", "preset", "region", "monitor")
 class WrapperError(Exception):
     """Fehler, die der Wrapper selbst meldet (Exit 7, JSON-Receipt)."""
 
-    def __init__(self, message: str, error_code: str = "runtime_error", exit_code: int = EXIT_RUNTIME):
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "runtime_error",
+        exit_code: int = EXIT_RUNTIME,
+        extra: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.error_code = error_code
         self.exit_code = exit_code
+        self.extra = extra or {}
 
 
 class Parser(argparse.ArgumentParser):
@@ -520,6 +527,105 @@ def resolve_preset(name: str) -> list[dict[str, Any]]:
     raise WrapperError(f"Preset '{name}' ist nicht bekannt", "preset_not_found", EXIT_NOT_FOUND)
 
 
+def normalize_process_name(raw: str) -> str:
+    lower = raw.strip().lower()
+    return lower[:-4] if lower.endswith(".exe") else lower
+
+
+def _rect_non_empty(rect: Any) -> bool:
+    if not isinstance(rect, list) or len(rect) != 4:
+        return False
+    try:
+        l, t, r, b = (int(v) for v in rect)
+    except (TypeError, ValueError):
+        return False
+    return r > l and b > t
+
+
+def resolve_single_window_preset(
+    name: str,
+    entry: dict[str, Any],
+    timeout: float,
+) -> tuple[list[str], Attempt]:
+    """Löst ein Einzel-Fenster-Preset mit `skip_minimized: true` fokus-sicher auf eine HWND auf.
+
+    Minimierte Zweitfenster desselben Prozesses (z. B. ein minimierter Server-Tab im Windows Terminal)
+    erzeugen dadurch keinen Fehlalarm `ambiguous_match`, und es wird niemals ein minimiertes Fenster
+    wiederhergestellt (0 Fokus-Klau).
+    """
+    process = entry.get("process")
+    title = entry.get("title")
+    if not process and not title:
+        raise WrapperError("Preset-Eintrag braucht 'process' und/oder 'title'")
+    for value in (process, title):
+        if value is not None and (not isinstance(value, str) or ";" in value):
+            raise WrapperError("Preset-Werte müssen Text ohne ';' sein")
+
+    list_args = argparse.Namespace(titles=bool(title), timeout=timeout)
+    list_receipt, list_code = run_list(list_args)
+    if list_code != EXIT_OK or not list_receipt.get("ok"):
+        raise WrapperError(
+            str(list_receipt.get("message") or "Fensterliste konnte für Preset nicht gelesen werden"),
+            str(list_receipt.get("error_code") or "runtime_error"),
+            list_code if list_code in range(1, 9) else EXIT_RUNTIME,
+        )
+
+    want_proc = normalize_process_name(process) if process else None
+    want_title = title.lower() if title else None
+    active: list[dict[str, Any]] = []
+    minimized: list[dict[str, Any]] = []
+    for win in list_receipt.get("windows") or []:
+        if not isinstance(win, dict):
+            continue
+        if not win.get("visible") or win.get("cloaked"):
+            continue
+        if not _rect_non_empty(win.get("rect")):
+            continue
+        if want_proc is not None and normalize_process_name(str(win.get("process") or "")) != want_proc:
+            continue
+        if want_title is not None and want_title not in str(win.get("title") or "").lower():
+            continue
+        if win.get("minimized"):
+            minimized.append(win)
+        else:
+            active.append(win)
+
+    if len(active) == 1:
+        chosen = active[0]
+        hwnd = chosen.get("hwnd")
+        if hwnd is None:
+            raise WrapperError("Preset-Treffer enthält keine gültige HWND")
+        procs = [process] if process else ([str(chosen["process"])] if chosen.get("process") else [])
+        cmd = ["window", "--hwnd", str(hwnd)]
+        if process:
+            cmd += ["--process", process]
+        if title:
+            cmd += ["--title", title]
+        return cmd, Attempt("preset", name, procs)
+    if len(active) > 1:
+        candidates = [
+            {"hwnd": w.get("hwnd"), "process": w.get("process"), "rect": w.get("rect")}
+            for w in active
+        ]
+        raise WrapperError(
+            "Mehrere aktive Fenster passen zum Preset; bitte eindeutiger wählen (--hwnd oder --title).",
+            "ambiguous_match",
+            EXIT_AMBIGUOUS,
+            extra={"candidates": candidates},
+        )
+    if minimized:
+        raise WrapperError(
+            "Passendes Fenster ist minimiert (kein Fokus-Klau / kein Wiederherstellen).",
+            "window_minimized",
+            EXIT_MINIMIZED,
+        )
+    raise WrapperError(
+        "Kein passendes sichtbares Fenster gefunden.",
+        "not_found",
+        EXIT_NOT_FOUND,
+    )
+
+
 def preset_match_specs(entries: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     specs: list[str] = []
     processes: list[str] = []
@@ -608,16 +714,25 @@ def run_capture(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             exe_args = group_args(specs)
         elif args.mode == "preset":
             entries = resolve_preset(args.name)
-            specs, processes = preset_match_specs(entries)
-            attempt = Attempt("preset", args.name, processes)
-            exe_args = group_args(specs)
+            has_skip_min = any(isinstance(e, dict) and e.get("skip_minimized") for e in entries)
+            if has_skip_min:
+                if len(entries) != 1 or not isinstance(entries[0], dict):
+                    attempt = Attempt("preset", args.name)
+                    raise WrapperError("skip_minimized wird nur für Einzel-Fenster-Presets unterstützt")
+                proc_hint = entries[0].get("process")
+                attempt = Attempt("preset", args.name, [proc_hint] if isinstance(proc_hint, str) and proc_hint else [])
+                exe_args, attempt = resolve_single_window_preset(args.name, entries[0], args.timeout)
+            else:
+                specs, processes = preset_match_specs(entries)
+                attempt = Attempt("preset", args.name, processes)
+                exe_args = group_args(specs)
         elif args.mode == "region":
             exe_args, attempt = region_args(args)
         else:
             exe_args, attempt = monitor_args(args)
     except WrapperError as error:
         attempt = attempt or Attempt(args.mode, args.mode)
-        receipt = failure(args.mode, error.error_code, str(error), error.exit_code)
+        receipt = failure(args.mode, error.error_code, str(error), error.exit_code, **error.extra)
         audit_attempt(attempt, receipt, started)
         return receipt, error.exit_code
 
