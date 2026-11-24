@@ -335,6 +335,67 @@ def test_preset_nightwatcher_builds_one_group_with_both_matchers(env: Env):
     ]
 
 
+def test_preset_herdr_selects_active_window_and_skips_minimized_without_titles(env: Env):
+    windows = [
+        {"hwnd": 2034364, "process": "windowsterminal", "rect": [354, 201, 2564, 1829], "visible": True, "minimized": False, "cloaked": False},
+        {"hwnd": 131596654, "process": "windowsterminal", "rect": [-31991, -32000, -31772, -31961], "visible": True, "minimized": True, "cloaked": False},
+        {"hwnd": 5575342, "process": "firefox", "rect": [100, 100, 1900, 1000], "visible": True, "minimized": False, "cloaked": False},
+    ]
+    out = env.out_dir / "herdr.png"
+    result = run(env, "preset", "herdr", "--out", str(out), extra_env={"FAKE_LIST_WINDOWS": json.dumps(windows)})
+    receipt = receipt_of(result)
+    assert result.returncode == 0
+    assert receipt["ok"] is True
+    assert out.read_bytes() == b"PNGDATA"
+    recorded = env.recorded()
+    assert len(recorded) == 2
+    assert recorded[0]["argv"] == ["list"]  # keine --titles nötig bei reinem Prozess-Filter
+    assert recorded[1]["argv"][:5] == ["window", "--hwnd", "2034364", "--process", "WindowsTerminal.exe"]
+
+
+def test_preset_herdr_fails_closed_when_only_minimized_window_exists(env: Env):
+    windows = [
+        {"hwnd": 131596654, "process": "windowsterminal", "rect": [-31991, -32000, -31772, -31961], "visible": True, "minimized": True, "cloaked": False},
+    ]
+    out = env.out_dir / "herdr-min.png"
+    result = run(env, "preset", "herdr", "--out", str(out), extra_env={"FAKE_LIST_WINDOWS": json.dumps(windows)})
+    receipt = receipt_of(result)
+    assert result.returncode == 4
+    assert receipt["error_code"] == "window_minimized"
+    assert not out.exists()
+    assert len(env.recorded()) == 1  # nur list, kein Capture-/Restore-Aufruf
+    audit = env.audit_lines()
+    assert len(audit) == 1
+    assert audit[0]["target"] == "herdr"
+    assert audit[0]["target_processes"] == ["WindowsTerminal.exe"]
+
+
+def test_preset_herdr_fails_closed_when_multiple_active_windows_exist(env: Env):
+    windows = [
+        {"hwnd": 1001, "process": "windowsterminal", "rect": [0, 0, 1200, 800], "visible": True, "minimized": False, "cloaked": False},
+        {"hwnd": 1002, "process": "windowsterminal", "rect": [100, 100, 1300, 900], "visible": True, "minimized": False, "cloaked": False},
+    ]
+    out = env.out_dir / "herdr-amb.png"
+    result = run(env, "preset", "herdr", "--out", str(out), extra_env={"FAKE_LIST_WINDOWS": json.dumps(windows)})
+    receipt = receipt_of(result)
+    assert result.returncode == 3
+    assert receipt["error_code"] == "ambiguous_match"
+    assert [c["hwnd"] for c in receipt["candidates"]] == [1001, 1002]
+    assert not out.exists()
+
+
+def test_preset_herdr_fails_closed_not_found_when_no_terminal_visible(env: Env):
+    windows = [
+        {"hwnd": 5575342, "process": "firefox", "rect": [100, 100, 1900, 1000], "visible": True, "minimized": False, "cloaked": False},
+    ]
+    out = env.out_dir / "herdr-none.png"
+    result = run(env, "preset", "herdr", "--out", str(out), extra_env={"FAKE_LIST_WINDOWS": json.dumps(windows)})
+    receipt = receipt_of(result)
+    assert result.returncode == 1
+    assert receipt["error_code"] == "not_found"
+    assert not out.exists()
+
+
 def test_unknown_preset_is_exit_1_and_never_starts_the_exe(env: Env):
     result = run(env, "preset", "doesnotexist", "--out", str(env.out_dir / "x.png"))
     receipt = receipt_of(result)

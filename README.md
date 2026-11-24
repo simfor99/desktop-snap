@@ -80,6 +80,7 @@ desktop-snap window --title "Live-Status" --out ./live.png
 desktop-snap window --process Herdr-Nachtwaechter.exe --title "Limits" --out ./limits.png
 desktop-snap group --match "Live-Status" --match "Limits" --out ./group.png
 desktop-snap preset nightwatcher --out ./nightwatcher.png --copy-desktop-temp
+desktop-snap preset herdr --out ./herdr.png
 desktop-snap region --process Herdr-Nachtwaechter.exe --x 0 --y 0 --w 590 --h 285 --out ./region.png
 desktop-snap monitor --index 0 --allow-full-monitor --out ./monitor.png
 desktop-snap list
